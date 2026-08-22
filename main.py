@@ -200,7 +200,9 @@ async def start_handler(event):
         "Hi! Send me any file (document, video, audio, photo) and I'll upload it "
         "to your Google Drive and send you the link back.\n\n"
         "There's no 20MB limit, you can even try the biggest file Telegram allows.\n\n"
-        "Send /myfiles to see the files you've uploaded."
+        "Send /myfiles to see the files you've uploaded.\n"
+        "Send /quota to check your Google Drive storage.\n"
+        "Send /cancel anytime to stop a pending action (like a rename)."
     )
 
 
@@ -275,6 +277,25 @@ async def myfiles_handler(event):
         "\n".join(lines),
         buttons=[[Button.inline("🗑 Delete ALL files shown above", data="delallask")]],
     )
+
+
+@client.on(events.NewMessage(pattern="/cancel"))
+async def cancel_handler(event):
+    if not is_allowed(event.sender_id):
+        return
+
+    cleared = False
+    if pending_renames.pop(event.sender_id, None) is not None:
+        cleared = True
+    if pending_lists.pop(event.sender_id, None) is not None:
+        cleared = True
+
+    if cleared:
+        await event.respond("✅ Cancelled. Any pending action has been cleared.")
+    else:
+        await event.respond("There was nothing to cancel.")
+
+    raise events.StopPropagation
 
 
 @client.on(events.NewMessage())
