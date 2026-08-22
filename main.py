@@ -130,6 +130,34 @@ def rename_drive_file(file_id: str, new_name: str):
     ).execute()
 
 
+def delete_drive_files_bulk(file_ids: list) -> tuple:
+    """Deletes multiple files using a single authenticated service instance."""
+    service = get_drive_service()
+    success = 0
+    failed = 0
+    for fid in file_ids:
+        try:
+            service.files().delete(fileId=fid, supportsAllDrives=True).execute()
+            success += 1
+        except Exception:
+            failed += 1
+    return success, failed
+
+
+def get_drive_quota():
+    """Returns (limit_bytes_or_None, usage_bytes) for the Google account."""
+    service = get_drive_service()
+    about = service.about().get(fields="storageQuota").execute()
+    quota = about.get("storageQuota", {})
+    limit = quota.get("limit")  # None means unlimited (e.g. Workspace plans)
+    usage = quota.get("usage", "0")
+    return (int(limit) if limit is not None else None), int(usage)
+
+
+def format_gb(num_bytes) -> str:
+    return f"{num_bytes / (1000 ** 3):.2f}"
+
+
 # ---------------------------------------------------------------------------
 # Telegram bot
 # ---------------------------------------------------------------------------
@@ -174,6 +202,32 @@ async def start_handler(event):
     )
 
 
+@client.on(events.NewMessage(pattern="/quota"))
+async def quota_handler(event):
+    if not is_allowed(event.sender_id):
+        await event.respond("You're not allowed to use this bot.")
+        return
+
+    status = await event.respond("📊 Fetching storage info...")
+
+    loop = asyncio.get_event_loop()
+    try:
+        limit, usage = await loop.run_in_executor(None, get_drive_quota)
+    except Exception as e:
+        log.exception("Error while fetching quota")
+        await status.edit(f"❌ Couldn't fetch storage info: {e}")
+        return
+
+    if limit is None:
+        await status.edit(f"📊 Storage used: {format_gb(usage)} GB (unlimited plan)")
+    else:
+        percent = (usage / limit * 100) if limit else 0
+        await status.edit(
+            f"📊 Google Drive storage:\n"
+            f"{format_gb(usage)} GB / {format_gb(limit)} GB used ({percent:.1f}%)"
+        )
+
+
 @client.on(events.NewMessage(pattern="/myfiles"))
 async def myfiles_handler(event):
     if not is_allowed(event.sender_id):
@@ -190,12 +244,23 @@ async def myfiles_handler(event):
         await status.edit(f"❌ Couldn't fetch the list: {e}")
         return
 
+    quota_line = ""
+    try:
+        limit, usage = await loop.run_in_executor(None, get_drive_quota)
+        if limit is None:
+            quota_line = f"📊 Storage used: {format_gb(usage)} GB (unlimited)\n\n"
+        else:
+            percent = (usage / limit * 100) if limit else 0
+            quota_line = f"📊 Storage: {format_gb(usage)} GB / {format_gb(limit)} GB used ({percent:.1f}%)\n\n"
+    except Exception:
+        pass  # quota is a bonus, don't fail the whole command over it
+
     if not files:
-        await status.edit("There are no files in the folder.")
+        await status.edit(f"{quota_line}There are no files in the folder.")
         return
 
     mapping = {}
-    lines = ["📂 Your files (newest first):\n"]
+    lines = [f"{quota_line}📂 Your files (newest first):\n"]
     for i, f in enumerate(files, start=1):
         mapping[str(i)] = {"id": f["id"], "name": f["name"]}
         size_txt = human_size(f.get("size")) if f.get("size") else "-"
@@ -204,7 +269,10 @@ async def myfiles_handler(event):
     lines.append("\nTo take action on a file, just send its number. Example: 2")
 
     pending_lists[event.sender_id] = mapping
-    await status.edit("\n".join(lines))
+    await status.edit(
+        "\n".join(lines),
+        buttons=[[Button.inline("🗑 Delete ALL files shown above", data="delallask")]],
+    )
 
 
 @client.on(events.NewMessage())
@@ -305,6 +373,35 @@ async def callback_handler(event):
             "✏️ Send the new file name (with extension, e.g. video.mp4) as a message.",
             buttons=[[Button.inline("❌ Cancel", data="cancel")]],
         )
+
+    elif data == "delallask":
+        mapping = pending_lists.get(event.sender_id, {})
+        count = len(mapping)
+        if count == 0:
+            await event.edit("Nothing to delete. Send /myfiles first.", buttons=None)
+            return
+        await event.edit(
+            f"⚠️ Are you sure you want to delete ALL {count} file(s) shown above? "
+            f"This can't be undone.",
+            buttons=[
+                [Button.inline(f"✅ Yes, delete all {count}", data="delallyes")],
+                [Button.inline("❌ Never mind", data="cancel")],
+            ],
+        )
+
+    elif data == "delallyes":
+        mapping = pending_lists.get(event.sender_id, {})
+        file_ids = [v["id"] for v in mapping.values()]
+        if not file_ids:
+            await event.edit("Nothing to delete. Send /myfiles first.", buttons=None)
+            return
+        await event.edit(f"🗑 Deleting {len(file_ids)} file(s)...", buttons=None)
+        success, failed = await loop.run_in_executor(None, delete_drive_files_bulk, file_ids)
+        pending_lists.pop(event.sender_id, None)
+        summary = f"🗑 Deleted {success} file(s)."
+        if failed:
+            summary += f" {failed} failed to delete."
+        await event.edit(summary, buttons=None)
 
 
 @client.on(events.NewMessage())
