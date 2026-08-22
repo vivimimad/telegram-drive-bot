@@ -123,6 +123,13 @@ def delete_drive_file(file_id: str):
     service.files().delete(fileId=file_id, supportsAllDrives=True).execute()
 
 
+def rename_drive_file(file_id: str, new_name: str):
+    service = get_drive_service()
+    service.files().update(
+        fileId=file_id, body={"name": new_name}, supportsAllDrives=True
+    ).execute()
+
+
 # ---------------------------------------------------------------------------
 # Telegram bot
 # ---------------------------------------------------------------------------
@@ -131,6 +138,9 @@ client = TelegramClient(StringSession(), API_ID, API_HASH)
 
 # user_id -> {str(index): {"id": drive_file_id, "name": filename}}
 pending_lists: dict[int, dict] = {}
+
+# user_id -> drive_file_id (waiting for the user to type a new name)
+pending_renames: dict[int, str] = {}
 
 
 def human_size(num_bytes) -> str:
@@ -157,44 +167,68 @@ async def start_handler(event):
     if not is_allowed(event.sender_id):
         return
     await event.respond(
-        "Merhaba! Bana bir dosya (belge, video, ses, foto) gönder, "
-        "Google Drive'ına yükleyip linkini sana geri göndereyim.\n\n"
-        "20MB gibi bir sınır yok, Telegram'ın izin verdiği en büyük dosyayı bile deneyebilirsin.\n\n"
-        "Yüklediğin dosyaları görmek için /myfiles yazabilirsin."
+        "Hi! Send me any file (document, video, audio, photo) and I'll upload it "
+        "to your Google Drive and send you the link back.\n\n"
+        "There's no 20MB limit, you can even try the biggest file Telegram allows.\n\n"
+        "Send /myfiles to see the files you've uploaded."
     )
 
 
 @client.on(events.NewMessage(pattern="/myfiles"))
 async def myfiles_handler(event):
     if not is_allowed(event.sender_id):
-        await event.respond("Bu botu kullanma yetkin yok.")
+        await event.respond("You're not allowed to use this bot.")
         return
 
-    status = await event.respond("📂 Dosyalar getiriliyor...")
+    status = await event.respond("📂 Fetching files...")
 
     loop = asyncio.get_event_loop()
     try:
         files = await loop.run_in_executor(None, list_drive_files)
     except Exception as e:
-        log.exception("Dosya listesi alınırken hata")
-        await status.edit(f"❌ Liste alınamadı: {e}")
+        log.exception("Error while fetching file list")
+        await status.edit(f"❌ Couldn't fetch the list: {e}")
         return
 
     if not files:
-        await status.edit("Klasörde hiç dosya yok.")
+        await status.edit("There are no files in the folder.")
         return
 
     mapping = {}
-    lines = ["📂 Dosyaların (en yeniden eskiye):\n"]
+    lines = ["📂 Your files (newest first):\n"]
     for i, f in enumerate(files, start=1):
         mapping[str(i)] = {"id": f["id"], "name": f["name"]}
         size_txt = human_size(f.get("size")) if f.get("size") else "-"
         lines.append(f"{i}. {f['name']} ({size_txt})")
 
-    lines.append("\nBir dosya için işlem yapmak istersen sadece numarasını yaz. Örnek: 2")
+    lines.append("\nTo take action on a file, just send its number. Example: 2")
 
     pending_lists[event.sender_id] = mapping
     await status.edit("\n".join(lines))
+
+
+@client.on(events.NewMessage())
+async def rename_reply_handler(event):
+    if event.sender_id not in pending_renames:
+        return
+    if not is_allowed(event.sender_id):
+        return
+
+    file_id = pending_renames.pop(event.sender_id)
+    new_name = (event.raw_text or "").strip()
+
+    if not new_name:
+        await event.respond("Empty name, rename cancelled.")
+        raise events.StopPropagation
+
+    loop = asyncio.get_event_loop()
+    try:
+        await loop.run_in_executor(None, rename_drive_file, file_id, new_name)
+        await event.respond(f"✏️ Renamed to: {new_name}")
+    except Exception as e:
+        await event.respond(f"❌ Couldn't rename it: {e}")
+
+    raise events.StopPropagation
 
 
 @client.on(events.NewMessage())
@@ -211,15 +245,16 @@ async def number_reply_handler(event):
     mapping = pending_lists[event.sender_id]
     choice = mapping.get(text)
     if not choice:
-        await event.respond("Bu numarada bir dosya yok. /myfiles ile listeyi tekrar al.")
+        await event.respond("There's no file with that number. Send /myfiles to get the list again.")
         return
 
     await event.respond(
-        f"📄 {choice['name']}\nNe yapmak istersin?",
+        f"📄 {choice['name']}\nWhat would you like to do?",
         buttons=[
-            [Button.inline("🔗 Link al", data=f"link:{choice['id']}")],
-            [Button.inline("🗑 Sil", data=f"delask:{choice['id']}")],
-            [Button.inline("❌ İptal", data="cancel")],
+            [Button.inline("🔗 Get link", data=f"link:{choice['id']}")],
+            [Button.inline("✏️ Rename", data=f"renask:{choice['id']}")],
+            [Button.inline("🗑 Delete", data=f"delask:{choice['id']}")],
+            [Button.inline("❌ Cancel", data="cancel")],
         ],
     )
 
@@ -227,13 +262,14 @@ async def number_reply_handler(event):
 @client.on(events.CallbackQuery())
 async def callback_handler(event):
     if not is_allowed(event.sender_id):
-        await event.answer("Yetkin yok.", alert=True)
+        await event.answer("You're not allowed to do this.", alert=True)
         return
 
     data = event.data.decode()
 
     if data == "cancel":
-        await event.edit("İptal edildi.", buttons=None)
+        pending_renames.pop(event.sender_id, None)
+        await event.edit("Cancelled.", buttons=None)
         return
 
     action, _, file_id = data.partition(":")
@@ -245,23 +281,30 @@ async def callback_handler(event):
             link = await loop.run_in_executor(None, get_drive_file_link, file_id)
             await event.edit(f"🔗 {link}", buttons=None)
         except Exception as e:
-            await event.edit(f"❌ Link alınamadı: {e}", buttons=None)
+            await event.edit(f"❌ Couldn't get the link: {e}", buttons=None)
 
     elif action == "delask":
         await event.edit(
-            "⚠️ Bu dosyayı silmek istediğine emin misin? Bu işlem geri alınamaz.",
+            "⚠️ Are you sure you want to delete this file? This can't be undone.",
             buttons=[
-                [Button.inline("✅ Evet, sil", data=f"delyes:{file_id}")],
-                [Button.inline("❌ Vazgeç", data="cancel")],
+                [Button.inline("✅ Yes, delete", data=f"delyes:{file_id}")],
+                [Button.inline("❌ Never mind", data="cancel")],
             ],
         )
 
     elif action == "delyes":
         try:
             await loop.run_in_executor(None, delete_drive_file, file_id)
-            await event.edit("🗑 Dosya silindi.", buttons=None)
+            await event.edit("🗑 File deleted.", buttons=None)
         except Exception as e:
-            await event.edit(f"❌ Silinemedi: {e}", buttons=None)
+            await event.edit(f"❌ Couldn't delete it: {e}", buttons=None)
+
+    elif action == "renask":
+        pending_renames[event.sender_id] = file_id
+        await event.edit(
+            "✏️ Send the new file name (with extension, e.g. video.mp4) as a message.",
+            buttons=[[Button.inline("❌ Cancel", data="cancel")]],
+        )
 
 
 @client.on(events.NewMessage())
@@ -270,14 +313,14 @@ async def file_handler(event):
         return  # dosya değilse (düz metin vs.) yoksay
 
     if not is_allowed(event.sender_id):
-        await event.respond("Bu botu kullanma yetkin yok.")
+        await event.respond("You're not allowed to use this bot.")
         return
 
-    filename = event.file.name or f"telegram_dosya_{int(time.time())}"
+    filename = event.file.name or f"telegram_file_{int(time.time())}"
     total_size = event.file.size or 0
 
     status = await event.respond(
-        f"📥 İndiriliyor: {filename} ({human_size(total_size)})"
+        f"📥 Downloading: {filename} ({human_size(total_size)})"
     )
 
     local_path = os.path.join(DOWNLOAD_DIR, filename)
@@ -292,7 +335,7 @@ async def file_handler(event):
         percent = (current / total * 100) if total else 0
         try:
             await status.edit(
-                f"📥 İndiriliyor: {filename}\n{human_size(current)} / {human_size(total)} ({percent:.0f}%)"
+                f"📥 Downloading: {filename}\n{human_size(current)} / {human_size(total)} ({percent:.0f}%)"
             )
         except Exception:
             pass
@@ -300,16 +343,16 @@ async def file_handler(event):
     try:
         await client.download_media(event.message, file=local_path, progress_callback=progress)
 
-        await status.edit(f"☁️ Google Drive'a yükleniyor: {filename}")
+        await status.edit(f"☁️ Uploading to Google Drive: {filename}")
 
         loop = asyncio.get_event_loop()
         link = await loop.run_in_executor(None, upload_to_drive, local_path, filename)
 
-        await status.edit(f"✅ Yüklendi: {filename}\n{link}")
+        await status.edit(f"✅ Uploaded: {filename}\n{link}")
 
     except Exception as e:
-        log.exception("Dosya işlenirken hata oluştu")
-        await status.edit(f"❌ Bir hata oluştu: {e}")
+        log.exception("Error while processing the file")
+        await status.edit(f"❌ Something went wrong: {e}")
 
     finally:
         if os.path.exists(local_path):
@@ -319,7 +362,7 @@ async def file_handler(event):
 async def main():
     await client.start(bot_token=BOT_TOKEN)
     me = await client.get_me()
-    log.info(f"Bot başladı: @{me.username}")
+    log.info(f"Bot started: @{me.username}")
     await client.run_until_disconnected()
 
 
