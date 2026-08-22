@@ -155,7 +155,9 @@ def get_drive_quota():
 
 
 def format_gb(num_bytes) -> str:
-    return f"{num_bytes / (1000 ** 3):.2f}"
+    # Google Drive's own UI reports storage using binary GiB (1024-based)
+    # even though it labels it "GB" - matching that here so the numbers agree.
+    return f"{num_bytes / (1024 ** 3):.2f}"
 
 
 # ---------------------------------------------------------------------------
